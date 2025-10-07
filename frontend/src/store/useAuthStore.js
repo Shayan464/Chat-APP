@@ -2,142 +2,145 @@ import { create } from "zustand";
 import { axiosInstance } from "../lib/axios";
 import toast from "react-hot-toast";
 import { io } from "socket.io-client";
+import { useChatStore } from "./useChatStore";
 
-const BASE_URL =
-  import.meta.env.MODE === "development" ? "http://localhost:5001/api" : "/api";
+const BASE_URL = "http://localhost:4000"; // Adjust for production
 
 export const useAuthStore = create((set, get) => ({
   authUser: null,
-  isSigningUp: false,
-  isLoggingIn: false,
-  isUpdatingProfile: false,
-  isCheckingAuth: true,
-  onlineUsers: [],
   socket: null,
-  chats: [], // optional: store received messages locally
+  socketUserId: null,
+  onlineUsers: [],
+  isCheckingAuth: true,
+  isLoggingIn: false,
 
+  // ✅ Check authentication and auto-connect socket
   checkAuth: async () => {
-    set({ isCheckingAuth: true });
     try {
-      axiosInstance.defaults.withCredentials = true;
-      const response = await axiosInstance.get("/auth/check");
-      set({ authUser: response.data });
+      const res = await axiosInstance.get("/auth/check");
+      set({ authUser: res.data, isCheckingAuth: false });
       get().connectSocket();
-    } catch (error) {
-      console.log("error in checkAuth", error);
-      localStorage.removeItem("token");
-      set({ authUser: null });
-    } finally {
-      set({ isCheckingAuth: false });
+    } catch (err) {
+      set({ authUser: null, isCheckingAuth: false });
+      console.error("checkAuth error:", err.message);
     }
   },
 
-  signup: async (data) => {
-    set({ isSigningUp: true });
-    try {
-      const res = await axiosInstance.post("/auth/signup", data);
-      if (res.data.token) localStorage.setItem("token", res.data.token);
-      set({ authUser: res.data.user || res.data });
-      toast.success("Account created successfully");
-    } catch (error) {
-      toast.error(error.response?.data?.message || "Signup failed");
-    } finally {
-      set({ isSigningUp: false });
-    }
-  },
-
-  login: async (data) => {
+  // ✅ Login (accepts single object)
+  login: async ({ email, password }) => {
     set({ isLoggingIn: true });
     try {
-      const res = await axiosInstance.post("/auth/login", data);
-      if (res.data.token) localStorage.setItem("token", res.data.token);
-      set({ authUser: res.data.user || res.data });
-      toast.success("Logged in Successfully");
+      const res = await axiosInstance.post("/auth/login", { email, password });
+      set({ authUser: res.data, isLoggingIn: false });
       get().connectSocket();
-    } catch (error) {
-      toast.error(error.response?.data?.message || "Login failed");
-    } finally {
+      toast.success("Login successful!");
+    } catch (err) {
       set({ isLoggingIn: false });
+      toast.error(err.response?.data?.message || "Login failed");
+      console.error("Login error:", err.message);
     }
   },
 
+  // ✅ Signup
+  signup: async (data) => {
+    try {
+      const res = await axiosInstance.post("/auth/signup", data);
+      set({ authUser: res.data });
+      get().connectSocket();
+      toast.success("Signup successful!");
+    } catch (err) {
+      toast.error(err.response?.data?.message || "Signup failed");
+    }
+  },
+
+  // ✅ Logout
   logout: async () => {
     try {
       await axiosInstance.post("/auth/logout");
-      localStorage.removeItem("token");
-      set({ authUser: null });
+      const socket = get().socket;
+      if (socket) socket.disconnect();
+      set({ authUser: null, socket: null, onlineUsers: [] });
       toast.success("Logged out successfully");
-      get().disconnectSocket();
-    } catch (error) {
-      toast.error(error.response?.data?.message || "Logout failed");
+    } catch (err) {
+      toast.error("Logout failed");
     }
   },
 
-  updateProfile: async (data) => {
-    set({ isUpdatingProfile: true });
-    try {
-      const res = await axiosInstance.put("/auth/update-profile", data);
-      set({ authUser: res.data });
-      toast.success("Profile updated successfully");
-    } catch (error) {
-      console.log("error in update profile", error);
-      toast.error(error.response?.data?.message || "Update failed");
-    } finally {
-      set({ isUpdatingProfile: false });
-    }
-  },
-
+  // ✅ Connect to Socket.IO server
   connectSocket: () => {
-    const { authUser } = get();
+    const { authUser, socket } = get();
     if (!authUser) return;
-    if (get().socket?.connected) return;
 
-    const socket = io(BASE_URL, {
-      query: { userId: authUser._id },
+    // If there's an existing socket but it belongs to a different user,
+    // disconnect it and create a fresh socket for the current authUser.
+    const currentSocketUserId = get().socketUserId;
+    if (socket?.connected && currentSocketUserId === authUser._id) return; // already connected as same user
+    if (socket?.connected && currentSocketUserId !== authUser._id) {
+      try {
+        socket.disconnect();
+      } catch (err) {
+        console.warn("Error disconnecting stale socket", err);
+      }
+      set({ socket: null, socketUserId: null });
+    }
+
+    const newSocket = io(BASE_URL, {
+      // include cookies during websocket handshake
+      withCredentials: true,
+      query: {
+        userId: authUser._id,
+        token: document?.cookie?.split("jwt=")[1],
+      },
       transports: ["websocket"],
+      reconnection: true,
+      reconnectionAttempts: 5,
     });
 
-    set({ socket });
-
-    socket.on("connect", () => {
-      console.log("✅ Socket connected:", socket.id);
+    newSocket.on("connect", () => {
+      console.log("✅ Socket connected:", newSocket.id);
+      set({ socket: newSocket, socketUserId: authUser._id });
+      // Register explicitly so server maps the socket to this authUser
+      try {
+        newSocket.emit("register", authUser._id);
+      } catch (err) {
+        console.warn("Failed to emit register", err);
+      }
+      // If a chat is already selected, ensure we subscribe to incoming messages
+      try {
+        const selectedUser = useChatStore.getState().selectedUser;
+        if (selectedUser) {
+          useChatStore.getState().unsubscribeFromMessages();
+          useChatStore.getState().subscribeToMessages();
+          // Optionally refetch messages to ensure up-to-date history
+          useChatStore.getState().getMessages(selectedUser._id);
+        }
+      } catch (err) {
+        console.warn(
+          "Failed to re-subscribe chat store after socket connect",
+          err
+        );
+      }
     });
 
-    socket.on("disconnect", () => {
-      console.log("❌ Socket disconnected");
+    newSocket.on("disconnect", (reason) => {
+      console.warn("⚠️ Socket disconnected:", reason);
+      set({ onlineUsers: [], socket: null, socketUserId: null });
     });
 
-    // Listen for online users
-    socket.on("onlineUsers", (users) => {
-      set({ onlineUsers: users });
-      console.log("👥 Online users:", users);
+    newSocket.on("connect_error", (err) => {
+      console.error("❌ Socket error:", err.message);
     });
 
-    // Listen for incoming messages
-    socket.on("receiveMessage", (msg) => {
-      console.log("📨 Message received:", msg);
-      set((state) => ({ chats: [...state.chats, msg] }));
+    newSocket.on("onlineUsers", (users) => {
+      if (Array.isArray(users)) {
+        set({ onlineUsers: users });
+        console.log("🟢 Online users updated:", users);
+      } else {
+        console.warn("Invalid onlineUsers payload:", users);
+        set({ onlineUsers: [] });
+      }
     });
-  },
 
-  disconnectSocket: () => {
-    if (get().socket?.connected) get().socket.disconnect();
-  },
-
-  sendMessage: ({ receiverId, text }) => {
-    const { socket, authUser } = get();
-    if (!socket || !authUser) return;
-
-    const message = {
-      senderId: authUser._id,
-      receiverId,
-      text,
-    };
-
-    console.log("📨 Sending message:", message);
-    socket.emit("sendMessage", message);
-
-    // Optionally, add to local chat immediately
-    set((state) => ({ chats: [...state.chats, message] }));
+    set({ socket: newSocket });
   },
 }));

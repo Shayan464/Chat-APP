@@ -8,9 +8,10 @@ const MessageInput = () => {
   const [imagePreview, setImagePreview] = useState(null);
   const fileInputRef = useRef(null);
 
-  const sendMessage = useChatStore((state) => state.sendMessage);
   const selectedUser = useChatStore((state) => state.selectedUser);
+  const sendMessage = useChatStore((state) => state.sendMessage);
 
+  // Handle file selection
   const handleImageChange = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -21,23 +22,22 @@ const MessageInput = () => {
     }
 
     const reader = new FileReader();
-    reader.onloadend = () => setImagePreview(reader.result); // base64 string
-    reader.readAsDataURL(file);
+    reader.onloadend = () => setImagePreview(reader.result);
+    reader.readAsDataURL(file); // convert to base64
   };
 
+  // Remove selected image
   const removeImage = () => {
     setImagePreview(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
+  // Send message handler
   const handleSendMessage = async (e) => {
     e.preventDefault();
     if (!text.trim() && !imagePreview) return;
 
-    await sendMessage({
-      text: text.trim(),
-      image: imagePreview,
-    });
+    await sendMessage(text.trim(), imagePreview);
 
     setText("");
     removeImage();
@@ -59,7 +59,7 @@ const MessageInput = () => {
             <img
               src={imagePreview}
               alt="Preview"
-              className="w-20 h-20 object-cover rounded-lg border border-zinc-700"
+              className="w-24 h-24 object-cover rounded-lg border border-zinc-700"
             />
             <button
               type="button"
@@ -81,7 +81,6 @@ const MessageInput = () => {
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
-
           <input
             type="file"
             accept="image/*"
