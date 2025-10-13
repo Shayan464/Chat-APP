@@ -6,84 +6,69 @@ import express from "express";
 
 const app = express();
 const server = http.createServer(app);
+const userSocketMap = {}; // { userId: [socketIds...] }
 
-// Map userId -> array of socketIds
-const userSocketMap = {}; // { userId: [socketId1, socketId2] }
-
-export const getReceiverSocketId = (userId) => {
-  return userSocketMap[userId] || [];
-};
-
-// Export the whole map for debugging (avoid in production)
+export const getReceiverSocketId = (userId) => userSocketMap[userId] || [];
 export const getUserSocketMap = () => userSocketMap;
 
-// Robust lookup: try exact match, then try to find a key that includes the provided id
 export const findSocketsForUser = (userId) => {
   if (!userId) return [];
-  const idStr = String(userId);
-  // Exact match
-  if (userSocketMap[idStr] && userSocketMap[idStr].length > 0)
-    return userSocketMap[idStr];
+  const id = String(userId);
+  if (userSocketMap[id]?.length) return userSocketMap[id];
 
-  // Fallback: find by suffix or includes (covers cases where keys are ObjectIds or have prefixes)
-  const keys = Object.keys(userSocketMap);
-  for (const k of keys) {
-    if (k === idStr) return userSocketMap[k];
-  }
-  for (const k of keys) {
-    if (k.includes(idStr) || k.endsWith(idStr)) return userSocketMap[k];
-  }
-  // Fallback: inspect live sockets for socket.data.userId matching
+  const match = Object.entries(userSocketMap).find(
+    ([k]) => k.includes(id) || k.endsWith(id)
+  );
+  if (match) return match[1];
+
   try {
-    if (typeof io !== "undefined" && io.sockets && io.sockets.sockets) {
-      const matches = [];
-      // io.sockets.sockets is a Map in socket.io v4
-      for (const [sid, sock] of io.sockets.sockets) {
-        try {
-          const sockUid =
-            sock.data?.userId ||
-            (sock.handshake?.query?.userId
-              ? String(sock.handshake.query.userId)
-              : null);
-          if (!sockUid) continue;
-          const sUid = String(sockUid);
-          if (sUid === idStr || sUid.includes(idStr) || sUid.endsWith(idStr)) {
-            matches.push(sid);
-          }
-        } catch (e) {
-          // ignore per-socket errors
-        }
-      }
-      if (matches.length) return matches;
-    }
-  } catch (err) {
-    console.warn("findSocketsForUser fallback failed", err);
+    return Array.from(io.sockets.sockets.values())
+      .filter((sock) => {
+        const uid = String(
+          sock.data?.userId || sock.handshake?.query?.userId || ""
+        );
+        return uid === id || uid.includes(id) || uid.endsWith(id);
+      })
+      .map((sock) => sock.id);
+  } catch {
+    return [];
   }
-  return [];
 };
 
 const io = new Server(server, {
-  // During development allow local origins (vite may pick 5173/5174 etc.)
   cors: {
-    origin: (origin, callback) => {
-      // allow all local origins and null (for some dev tools)
-      if (!origin || origin.startsWith("http://localhost"))
-        return callback(null, true);
-      return callback(null, true);
-    },
+    origin: (origin, cb) =>
+      !origin || origin.startsWith("http://localhost")
+        ? cb(null, true)
+        : cb(null, true),
     credentials: true,
   },
 });
 
+const addSocket = (userId, socketId) => {
+  if (!userId) return;
+  const id = String(userId);
+  userSocketMap[id] ??= [];
+  if (!userSocketMap[id].includes(socketId)) userSocketMap[id].push(socketId);
+};
+
+const removeSocket = (userId, socketId) => {
+  if (!userId || !userSocketMap[userId]) return;
+  userSocketMap[userId] = userSocketMap[userId].filter((id) => id !== socketId);
+  if (!userSocketMap[userId].length) delete userSocketMap[userId];
+};
+
+const broadcastOnlineUsers = () =>
+  io.emit("onlineUsers", Object.keys(userSocketMap));
+
 io.on("connection", (socket) => {
-  console.log("✅ A user connected:", socket.id);
-  // Try to authenticate socket using JWT cookie first (more reliable)
+  console.log("✅ Connected:", socket.id);
   let userId = null;
+
+  // --- JWT Auth ---
   try {
-    const cookieHeader = socket.handshake.headers?.cookie || "";
-    // parse cookie string to find jwt
     const cookies = Object.fromEntries(
-      cookieHeader.split(";").map((c) => {
+      (socket.handshake.headers.cookie || "").split(";").map((c) => {
         const [k, ...v] = c.split("=");
         return [k?.trim(), v?.join("=")];
       })
@@ -91,104 +76,47 @@ io.on("connection", (socket) => {
     const token = cookies.jwt || socket.handshake.query?.token;
     if (token) {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      if (decoded && decoded.userId) {
-        userId = String(decoded.userId);
-        socket.data = socket.data || {};
-        socket.data.userId = userId; // authoritative
-        if (!userSocketMap[userId]) userSocketMap[userId] = [];
-        if (!userSocketMap[userId].includes(socket.id))
-          userSocketMap[userId].push(socket.id);
-        console.log(
-          `[socket] jwt-auth mapped user '${userId}' -> sockets:`,
-          userSocketMap[userId]
-        );
-      }
+      userId = decoded?.userId ? String(decoded.userId) : null;
     }
   } catch (err) {
-    console.warn(
-      "Socket JWT verify failed or not provided",
-      err?.message || err
-    );
+    console.warn("JWT verify failed:", err.message);
   }
 
-  if (!userId) {
-    // fallback to query userId if JWT not present
-    const rawUserId = socket.handshake.query.userId;
-    userId = rawUserId != null ? String(rawUserId) : null;
-    if (userId) {
-      if (!userSocketMap[userId]) userSocketMap[userId] = [];
-      userSocketMap[userId].push(socket.id);
-      console.log(
-        `[socket] mapped user key: '${userId}' -> sockets:`,
-        userSocketMap[userId]
-      );
-    } else {
-      console.log(
-        "[socket] connection without userId in handshake query or jwt:",
-        socket.id
-      );
-    }
+  // --- Fallback to query userId ---
+  userId ||= socket.handshake.query.userId;
+  if (userId) {
+    addSocket(userId, socket.id);
+    socket.data.userId = String(userId);
+  } else {
+    console.log("⚠️ Unauthenticated socket:", socket.id);
   }
 
-  // Allow client to explicitly register its userId after connect.
+  broadcastOnlineUsers();
+
   socket.on("register", (uid) => {
-    try {
-      const regId = uid != null ? String(uid) : null;
-      if (!regId) return;
-      // Mark on socket.data for cleanup
-      socket.data = socket.data || {};
-      socket.data.userId = regId;
-      if (!userSocketMap[regId]) userSocketMap[regId] = [];
-      if (!userSocketMap[regId].includes(socket.id))
-        userSocketMap[regId].push(socket.id);
-      console.log(
-        `[socket] registered user '${regId}' -> sockets:`,
-        userSocketMap[regId]
-      );
-      io.emit("onlineUsers", Object.keys(userSocketMap));
-    } catch (err) {
-      console.error("Error in register handler", err);
-    }
+    if (!uid) return;
+    addSocket(uid, socket.id);
+    socket.data.userId = String(uid);
+    broadcastOnlineUsers();
   });
 
-  // notify all clients of current online users
-  io.emit("onlineUsers", Object.keys(userSocketMap));
-
-  // Listen for messages
-  // Listen for messages sent via socket (optional - server controller emits saved messages)
-  // Accept text and optional image and forward as-is so realtime works if client emits directly
   socket.on("sendMessage", ({ receiverId, text, image }) => {
-    console.log("[socket] sendMessage received from", userId, {
+    const payload = {
+      senderId: userId,
       receiverId,
       text,
-      hasImage: !!image,
-    });
-    const sockets = getReceiverSocketId(receiverId);
-    const payload = { senderId: userId, receiverId, text };
-    if (image) payload.image = image;
-    sockets.forEach((id) => {
-      io.to(id).emit("receiveMessage", payload);
-    });
+      ...(image && { image }),
+    };
+    getReceiverSocketId(receiverId).forEach((id) =>
+      io.to(id).emit("receiveMessage", payload)
+    );
   });
 
   socket.on("disconnect", () => {
-    console.log("❌ User disconnected:", socket.id);
-    if (userId && userSocketMap[userId]) {
-      userSocketMap[userId] = userSocketMap[userId].filter(
-        (id) => id !== socket.id
-      );
-      if (userSocketMap[userId].length === 0) delete userSocketMap[userId];
-    }
-
-    const regId = socket.data?.userId;
-    if (regId && userSocketMap[regId]) {
-      userSocketMap[regId] = userSocketMap[regId].filter(
-        (id) => id !== socket.id
-      );
-      if (userSocketMap[regId].length === 0) delete userSocketMap[regId];
-    }
-
-    io.emit("onlineUsers", Object.keys(userSocketMap));
+    console.log("❌ Disconnected:", socket.id);
+    removeSocket(userId, socket.id);
+    removeSocket(socket.data?.userId, socket.id);
+    broadcastOnlineUsers();
   });
 });
 
